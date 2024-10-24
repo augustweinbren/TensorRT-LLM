@@ -16,122 +16,161 @@ namespace tensorrt_llm::kernels
 
 // Structure to hold parameters for the kernel that applies CFG constraints
 template <typename T>
-struct CFGConstraintsKernelParams
+struct GrammarSamplingKernelParams
 {
-    //! Input buffer [batchSize, vocabSizePadded].
-    //! Logits for each token in the vocabulary for each batch element.
-    T* logits{nullptr};
+    //! Input buffer [batchSize, maxTokensPerStep, vocabSizePadded].
+    //! Log probabilities of each token in the vocab. If logitsHasProbs is true,
+    //! logProbs must contain **just** probabilities instead of log probabilities.
+    T const* logProbs{nullptr};
+    //! input buffer [batchSize][tokensPerStep, vocabSizePadded] array of pointers to logits.
+    //! If nullptr, logProbs is used.
+    T const* const* logProbsPtrs{nullptr};
 
-    //! Output IDs pointers per batch [batchSize], pointing to arrays of token IDs.
-    int32_t** outputIdsPtrs{nullptr};
+    //! output buffer [maxBatchSize][maxSeqLen], optional. Contains pointers to rows
+    //! with output tokens per request. If nullptr, outputIds must be provided.
+    runtime::TokenIdType** outputIdsPtrs{nullptr};
+    //! output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output tokens.
+    //! Not used if outputIdsPtrs != nullptr
+    runtime::TokenIdType* outputIds{nullptr};
 
-    //! Sequence lengths per batch [batchSize].
-    int32_t const* sequenceLengths{nullptr};
-
-    //! Batch slots [batchSize], mapping batch indices to actual batch slots if needed.
-    int32_t const* batchSlots{nullptr};
-
-    //! Batch size.
-    int32_t batchSize{-1};
-
-    //! Padded vocabulary size.
-    int32_t vocabSizePadded{-1};
-
-    //! Current decoding step.
-    int32_t step{-1};
-
-    //! Device buffer [batchSize, vocabSizePadded] indicating allowed tokens per batch.
-    //! Each element is a boolean indicating whether a token is allowed.
-    bool* allowedTokens{nullptr};
-};
-
-// Kernel invocation function to apply CFG constraints to logits
-template <typename T>
-void invokeApplyCFGConstraints(CFGConstraintsKernelParams<T>& params, cudaStream_t stream);
-
-// Structure to hold parameters for the sampling kernel with constraints
-template <typename T>
-struct SamplingKernelParams
-{
-    //! Input buffer [batchSize, vocabSizePadded].
-    //! Log probabilities of each token in the vocabulary for each batch element.
-    T* logProbs{nullptr};
-
-    //! Output IDs pointers per batch [batchSize], pointing to arrays of token IDs.
-    int32_t** outputIdsPtrs{nullptr};
-
-    //! Pointer to the workspace needed for sampling.
+    //! Required. Pointer to the workspace of size returned by getTopKWorkspaceSize.
+    //! Has to be pre-allocated by caller.
+    //! Function does not take ownership of the buffer
     void* workspace{nullptr};
 
     //! Sequence lengths per batch [batchSize].
     int32_t const* sequenceLengths{nullptr};
 
-    //! End IDs per batch [batchSize].
-    int32_t const* endIds{nullptr};
+    //! input buffer [maxBatchSize], optional. EOS token ids per request
+    runtime::TokenIdType const* endIds{nullptr};
+
+    //! Sequence lengths per batch [batchSize].
+    int32_t const* sequenceLengths{nullptr};
 
     //! Batch slots [batchSize], mapping batch indices to actual batch slots if needed.
     int32_t const* batchSlots{nullptr};
 
-    //! Finished state input per batch [batchSize].
-    runtime::FinishedState const* finishedInput{nullptr};
+    //! input buffer [maxBatchSize], optional. Number of tokens per step for each request.
+    //! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
+    runtime::SizeType32 const* tokensPerStep{nullptr};
 
-    //! Finished state output per batch [batchSize].
-    runtime::FinishedState* finishedOutput{nullptr};
-
-    //! Cumulative log probabilities per batch [batchSize].
-    float* cumLogProbs{nullptr};
-
-    //! Output log probabilities per batch [batchSize].
-    float* outputLogProbs{nullptr};
-
-    //! CURAND states per batch [batchSize].
-    curandState_t* curandState{nullptr};
-
-    //! Batch size.
-    int32_t batchSize{-1};
-
-    //! Maximum batch size.
-    int32_t maxBatchSize{-1};
-
-    //! Maximum tokens per step.
-    int32_t maxTokensPerStep{-1};
-
-    //! Padded vocabulary size.
-    int32_t vocabSizePadded{-1};
-
-    //! Flag indicating whether the logits are probabilities (true) or log probabilities (false).
-    bool logitsHasProbs{false};
-
-    //! Maximum top K value for sampling.
-    int32_t maxTopK{-1};
-
-    //! Top K values per batch [batchSize].
-    int32_t const* topKs{nullptr};
-
-    //! Maximum top P value for sampling.
-    float maxTopP{1.0f};
-
-    //! Top P values per batch [batchSize].
-    float const* topPs{nullptr};
-
-    //! Skip decode flags per batch [batchSize].
+    //! input buffer [maxBatchSize], optional. If true, request exits early.
+    FinishedState const* finishedInput{nullptr};
+    //! output buffer [maxBatchSize], optional.
+    //! Set to true if sequence has finished (if finished || outputId == endId).
+    FinishedState* finishedOutput{nullptr};
+    //! input buffer [maxBatchSize]. Flags whether to skip decoding per request
     bool const* skipDecode{nullptr};
 
-    //! Flag to normalize log probabilities.
+    //! input/output buffer [maxBatchSize], optional.
+    //! Cumulative log probability of selected tokens. Ignored if nullptr
+    float* cumLogProbs{nullptr};
+    //! output buffer [maxBatchSize]. Log probs is the probability induced by the top-k sampling.
+    //! If normalizeLogProbs is true, we normalize the probability 'expLogit' of the selected token
+    //! by the probability 's_sum' of a set of top-k tokens, meaning the logProb is the probability
+    //! of the selected token, conditioned on the event that it is selected,
+    //! i.e., log_prob = log P(i | i is in top-k) = log(expLogit / s_sum).
+    //! Ignored if nullptr.
+    float* outputLogProbs{nullptr};
+
+    //! input buffer [maxBatchSize], optional. Initialized curand states.
+    //! If nullptr, 1 is always used.
+    curandState_t* curandState{nullptr};
+
+    //! Allowed tokens for the next iteration, grouped by rules (e.g. to store "a" and "ab" together)
+    runtime::TokenIdType** allowedTokens{nullptr};
+
+    //! max probability for constrained decoding sampling
+    runtime::TokenIdType maxConstrained{nullptr};
+
+    runtime::SizeType32 batchSize{-1};
+    runtime::SizeType32 maxBatchSize{-1};
+    runtime::SizeType32 vocabSizePadded{-1};
+    runtime::SizeType32 maxTokensPerStep{-1};
+    runtime::SizeType32 maxSeqLen{-1};
+
+    //! Current decoding step.
+    int32_t step{-1};
+
+    //! when set to True outputLogProbs are normalized to Grammar
     bool normalizeLogProbs{false};
-
-    //! Tokens per step per batch [batchSize], optional.
-    int32_t const* tokensPerStep{nullptr};
-
-    //! Maximum sequence length.
-    int32_t maxSeqLen{-1};
-
-    //! Flag to return all selected tokens.
+    //! flag to highlight that logProbs contains probabilities
+    bool logitsHasProbs{false};
+    //! flag to return all selected Grammar sampled results
     bool returnAllSelectedTokens{false};
 };
+    
+    void checkParams() const
+    {
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(maxBatchSize > 0);
+        TLLM_CHECK(maxBatchSize >= batchSize);
+        TLLM_CHECK(vocabSizePadded > 0);
+        TLLM_CHECK(maxTokensPerStep > 0);
 
-// Kernel invocation function for sampling with constraints
+        TLLM_CHECK(logProbs || logProbsPtrs);
+        TLLM_CHECK(outputIds || outputIdsPtrs);
+
+        if (maxTokensPerStep > 1)
+        {
+            TLLM_CHECK(tokensPerStep);
+        }
+
+        if (outputIds)
+        {
+            TLLM_CHECK(maxSeqLen > 0);
+        }
+
+        TLLM_CHECK(workspace);
+
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || sequenceLengths);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || endIds);
+        if (cumLogProbs != nullptr || outputLogProbs != nullptr)
+        {
+            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllSelectedTokens);
+        }
+        TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
+    }
+};
+
+// clang-format off
+//! \brief Given logProbs, performs Grammar sampling. Fills sampled tokens to outputIds.
+//! Computes sequenceLength, finished state, cumLogProbs inplace.
+//! Sampling per request can be controlled using skipDecode.
+//! Function sets workspaceSize and exits early if workspace is nullptr.
+//! If logits are Nan, we set output token to be the last in the vocabulary.
+// clang-format on
 template <typename T>
-void invokeSamplingWithConstraints(SamplingKernelParams<T>& params, cudaStream_t stream);
+void invokeBatchGrammarSampling(GrammarSamplingKernelParams<T>& params, cudaStream_t stream);
+
+template <typename T>
+[[nodiscard]] std::vector<size_t> getGrammarWorkspaceSizes(runtime::SizeType32 batchSize,
+    runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 maxGrammar, runtime::SizeType32 vocabSizePadded)
+{
+    runtime::SizeType32 constexpr maxBlockPerBeam = 8;
+    auto const tempLogProbsBufSize = sizeof(T) * batchSize * maxTokensPerStep * vocabSizePadded;         // type T
+    auto const grammarTmpIdsBufSize
+        = sizeof(runtime::SizeType32) * batchSize * maxTokensPerStep * maxGrammar * maxBlockPerBeam;        // type int
+    auto const grammarTmpValBufSize = sizeof(T) * batchSize * maxTokensPerStep * maxGrammar * maxBlockPerBeam; // type T
+
+    return {tempLogProbsBufSize, grammarTmpIdsBufSize, grammarTmpValBufSize};
+}
+
+//! \brief Returns workspace size in bytes needed for sampling TopK computation
+//! \param batchSize batch size
+//! \param maxTokensPerStep maximum number of tokens per computed per step
+//! \param maxTopK maximum among all topKs K for topK sampling
+//! \param vocabSizePadded size of padded vocab
+template <typename T>
+[[nodiscard]] size_t getGrammarWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 maxTokensPerStep,
+    runtime::SizeType32 maxGrammar, runtime::SizeType32 vocabSizePadded)
+{
+    auto const workspaceSizes = getGrammarWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
+    return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
+}
+
+void invokeSetupGrammarRuntimeArgs(runtime::SizeType32 batchSize, runtime::TokenIDType* grammar,
+    runtime::SizeType32* grammarDevicePtr, runtime::SizeType32 runtimeGrammarSize,
+    bool* skipDecodeDevicePtr, runtime::SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

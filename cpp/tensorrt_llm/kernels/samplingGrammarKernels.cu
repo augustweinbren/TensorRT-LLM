@@ -26,7 +26,7 @@ namespace tensorrt_llm::kernels
     } while (0)
 
 template <typename T>
-__global__ void applyCFGConstraintsKernel(CFGConstraintsKernelParams<T> params)
+__global__ void applyCFGConstraintsKernel(GrammarSamplingKernelParams<T> params)
 {
     // Each block handles one batch element
     int32_t batchId = blockIdx.x;
@@ -62,7 +62,7 @@ __global__ void applyCFGConstraintsKernel(CFGConstraintsKernelParams<T> params)
 }
 
 template <typename T>
-void invokeApplyCFGConstraints(CFGConstraintsKernelParams<T>& params, cudaStream_t stream)
+void invokeApplyCFGConstraints(GrammarSamplingKernelParams<T>& params, cudaStream_t stream)
 {
     int32_t threadsPerBlock = 256;
     int32_t blocksPerGrid = params.batchSize;
@@ -74,7 +74,7 @@ void invokeApplyCFGConstraints(CFGConstraintsKernelParams<T>& params, cudaStream
 }
 
 template <typename T>
-void invokeSamplingWithConstraints(SamplingKernelParams<T>& params, cudaStream_t stream)
+void invokeBatchGrammarSampling(SamplingKernelParams<T>& params, cudaStream_t stream)
 {
     // Reuse the existing sampling kernel from samplingTopKKernels.cu
     // Adjust it to operate on the constrained logits
@@ -112,11 +112,11 @@ void invokeSamplingWithConstraints(SamplingKernelParams<T>& params, cudaStream_t
 }
 
 // Explicit template instantiation
-template void invokeApplyCFGConstraints<float>(CFGConstraintsKernelParams<float>& params, cudaStream_t stream);
-template void invokeApplyCFGConstraints<half>(CFGConstraintsKernelParams<half>& params, cudaStream_t stream);
+template void invokeApplyCFGConstraints<float>(GrammarSamplingKernelParams<float>& params, cudaStream_t stream);
+template void invokeApplyCFGConstraints<half>(GrammarSamplingKernelParams<half>& params, cudaStream_t stream);
 
-template void invokeSamplingWithConstraints<float>(SamplingKernelParams<float>& params, cudaStream_t stream);
-template void invokeSamplingWithConstraints<half>(SamplingKernelParams<half>& params, cudaStream_t stream);
+template void invokeBatchGrammarSampling<float>(SamplingKernelParams<float>& params, cudaStream_t stream);
+template void invokeBatchGrammarSampling<half>(SamplingKernelParams<half>& params, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels
 

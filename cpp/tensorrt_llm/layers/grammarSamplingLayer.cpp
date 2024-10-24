@@ -1,6 +1,7 @@
 #include "grammarSamplingLayer.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/samplingGrammarKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 
@@ -95,7 +96,7 @@ void GrammarSamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> 
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
     params.logitsHasProbs = inputs->probsComputed;
 
-    invokeSamplingWithConstraints(params, getStream());
+    invokeBatchGrammarSampling(params, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -109,7 +110,7 @@ void GrammarSamplingLayer<T>::applyCFGConstraints(T* logits, TokenIdType** outpu
     // For simplicity, let's assume we have a kernel that does this
 
     // Prepare parameters for the kernel
-    CFGConstraintsKernelParams<T> params;
+    GrammarSamplingKernelParams<T> params;
     params.logits = logits;
     params.outputIdsPtrs = outputIdsPtr;
     params.sequenceLengths = sequenceLengths;
