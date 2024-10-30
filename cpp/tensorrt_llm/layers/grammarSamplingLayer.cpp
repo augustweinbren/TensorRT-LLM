@@ -17,27 +17,35 @@ namespace tensorrt_llm::layers
 
 template <typename T>
 GrammarSamplingLayer<T>::GrammarSamplingLayer(
+    executor::DecodingMode const& mode,
     DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
-    : BaseLayer(decoderDomain, bufferManager)
+    : BaseLayer(decoderDomain, bufferManager),
+    mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    allocateBuffer(mDecoderDomain.getBatchSize());
+    allocateBuffer();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void GrammarSamplingLayer<T>::allocateBuffer(SizeType32 const batchSize)
+void GrammarSamplingLayer<T>::allocateBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // Allocate any additional buffers needed for constrained decoding
-    mWorkspaceSize = getGrammarSamplingWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
+    if (mDecodingMode.isUseContextFreeGrammar()) {
+        mAllowedTokensDevice 
+            = mBufferManager->gpu(ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<SizeType32>::value);
+    }
+
+
+    // // Allocate any additional buffers needed for constrained decoding
+    // mWorkspaceSize = getGrammarSamplingWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
 
     // For example, allocate buffer to store allowed tokens per batch
-    mAllowedTokensDevice = mBufferManager->gpu(
-        ITensor::makeShape({batchSize, mDecoderDomain.getVocabSizePadded()}), TRTDataType<bool>::value);
+    mAllowedTokens = mBufferManager->pinnedPool(
+        ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<SizeType32>::value);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -50,10 +58,40 @@ void GrammarSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, 
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     // Setup any CFG-related parameters here
-    auto setupParams = std::dynamic_pointer_cast<GrammarSamplingSetupParams>(baseSetupParams);
-    mCFG = setupParams->cfg; // Assuming cfg is passed in setupParams
+    auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
+    auto const& grammarParams = setupParams->grammarParams
+    TLLM_CHECK_WITH_INFO(grammarParams, "grammarParams not set for setup")
+    FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+// Applies CFG constraints to the logits
+void applyCFGConstraints(TensorPtr const& logits, std::shared_ptr<BaseDecodingOutputs> const& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, BufferConstPtr const& batchSlots,
+    DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen) 
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto const maxCFGLength = inputs->constrainedDecodingInputs->maxGrammarLen;
+    if (maxCFGLength != 0)
+    {
+        // Temporary variables to store dereferenced inputs
+        auto grammarPtr = bufferCast<TokenIdType const*>(*inputs->constrainedDecodingInputs->grammarPtr.value());
+        auto grammarLens = bufferCast<SizeType32>(*inputs->constrainedDecodingInputs->grammarLengths.value());
+        auto logitsPtr = bufferCast<T>(*logits);
+        auto outputIdsPtr = bufferCast<TokenIdType const*>(*outputs->outputIdsPtr);
+        auto parentIdsPtr
+            = decoderDomain.getBeamWidth() > 1 ? bufferCast<SizeType32 const*>(*outputs->parentIdsPtr) : nullptr;
+        auto sequenceLengthPtr = bufferCast<SizeType32>(*outputs->sequenceLength.value());
+        auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
+
+        // Call to invokeConstrainedDecoding with dereferenced inputs
+        invokeApplyCFGConstraints(logitsPtr, outputIdsPtr, parentIdsPtr, batchSlotsPtr, decoderDomain.getBatchSize(),
+            decoderDomain.getBeamWidth(), grammarPtr, grammarLens, maxGrammarLen,
+            decoderDomain.getVocabSizePadded(), sequenceLengthPtr, maxSeqLen, getStream());
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+
 }
 
 template <typename T>
@@ -63,64 +101,18 @@ void GrammarSamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> 
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
+    auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
+    
+    TLLM_CHECK_WITH_INFO(inputs->constrainedDecodingInputs, "constrainedDecodingInputs for forward is not set");
 
-    auto const batchSize = inputs->logits.value()->getDimension<0>();
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
+    auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
 
-    auto logits = bufferCastOrNull<T>(inputs->logits);
-    auto const* endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
-
-    auto* outputIdsPtr = bufferCastOrNull<TokenIdType*>(outputs->outputIdsPtr);
-    auto const* sequenceLengths = bufferCastOrNull<SizeType32>(outputs->sequenceLength);
-    auto const* batchSlotsDevicePtr = workspace->getDeviceBatchSlotsPtr();
-
-    // Apply CFG constraints to logits
-    applyCFGConstraints(logits, outputIdsPtr, sequenceLengths, batchSlotsDevicePtr, batchSize, inputs->step);
-
-    // Proceed with sampling
-    SamplingKernelParams<T> params;
-    params.logProbs = logits;
-    params.outputIdsPtrs = outputIdsPtr;
-    params.workspace = workspace->getRawWorkspaceDevicePtr();
-    params.sequenceLengths = sequenceLengths;
-    params.endIds = endIds;
-    params.batchSlots = batchSlotsDevicePtr;
-    params.finishedInput = reinterpret_cast<FinishedState const*>(bufferCastOrNull<FinishedState::UnderlyingType>(inputs->finished));
-    params.finishedOutput = reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished));
-    params.cumLogProbs = bufferCastOrNull<float>(outputs->cumLogProbs);
-    params.outputLogProbs = bufferCastOrNull<float>(outputs->outputLogProbsTiled);
-    params.curandState = inputs->curandStates;
-    params.batchSize = batchSize;
-    params.maxBatchSize = mDecoderDomain.getBatchSize();
-    params.maxTokensPerStep = 1;
-    params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.logitsHasProbs = inputs->probsComputed;
-
-    invokeBatchGrammarSampling(params, getStream());
+    applyCFGConstraints(workspace->getDeviceRuntimeLogits(), outputs, inputs, workspace->getDeviceBatchSlots(),
+        getLocalDecoderDomain, maxSeqLen);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void GrammarSamplingLayer<T>::applyCFGConstraints(T* logits, TokenIdType** outputIdsPtr,
-    SizeType32 const* sequenceLengths, SizeType32 const* batchSlotsDevicePtr, SizeType32 batchSize, int32_t step)
-{
-    // For each batch element, apply CFG constraints to the logits
-    // This can be done efficiently using a CUDA kernel
-    // For simplicity, let's assume we have a kernel that does this
-
-    // Prepare parameters for the kernel
-    GrammarSamplingKernelParams<T> params;
-    params.logits = logits;
-    params.outputIdsPtrs = outputIdsPtr;
-    params.sequenceLengths = sequenceLengths;
-    params.batchSlots = batchSlotsDevicePtr;
-    params.batchSize = batchSize;
-    params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.step = step;
-    params.cfg = mCFG; // Pass the CFG to the kernel
-
-    invokeApplyCFGConstraints(params, getStream());
 }
 
 template <typename T>
