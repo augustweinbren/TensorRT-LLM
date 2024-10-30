@@ -1,7 +1,11 @@
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
+
+#include <curand_kernel.h>
 
 namespace tensorrt_llm::layers
 {
