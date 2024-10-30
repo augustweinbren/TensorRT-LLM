@@ -15,36 +15,42 @@ class GrammarSamplingLayer : public BaseLayer
     using Base = BaseLayer;
 
 public:
-    GrammarSamplingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
+    GrammarSamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
+    //! \brief Modifies 'outputs->logits' in-place with -INF for outputs not matching grammar
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    //! @returns workspace needed for this layer in bytes
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
+    // //! @returns workspace needed for this layer in bytes
+    // [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
-protected:
-    size_t mWorkspaceSize{0};
+// protected:
+//     size_t mWorkspaceSize{0};
 
-    // Data structure representing the context-free grammar (CFG)
-    CFGData mCFG;
+//     // Data structure representing the context-free grammar (CFG)
+//     //TODO: change this to the 
+//     CFGData mCFG;
 
-    // Device buffer for allowed tokens per batch
-    TensorPtr mAllowedTokensDevice;
+//     // Device buffer for allowed tokens per batch
+//     TensorPtr mAllowedTokensDevice;
 
-    using Base::mDecoderDomain;
+//     using Base::mDecoderDomain;
 
 private:
-    void allocateBuffer(runtime::SizeType32 batchSize);
+    void allocateBuffer();
 
     // Applies CFG constraints to the logits
-    void applyCFGConstraints(T* logits, TokenIdType** outputIdsPtr, runtime::SizeType32 const* sequenceLengths,
-                             runtime::SizeType32 const* batchSlotsDevicePtr, runtime::SizeType32 batchSize, int32_t step);
+    void applyCFGConstraints(TensorPtr const& logits, std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<DecodingInputs> const& inputs, BufferConstPtr const& batchSlots,
+        DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen);
+
+    executor::DecodingMode mDecodingMode;
 };
 
 } // namespace tensorrt_llm::layers
