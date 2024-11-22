@@ -16,52 +16,31 @@
  */
 
 #include "llama-grammar.h"
+#include <string>
+#include <vector>
+#include <cassert>
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/plugins/api/tllmPlugin.h"
 
 namespace tlc = tensorrt_llm::common;
 namespace tle = tensorrt_llm::executor;
 
-int llama_grammar(const std::string &grammar_str) {
-    std::string grammar_str_temp = 
-        R"""(
-            root ::= expr
-            expr ::= term ("+" term)*
-            term ::= number
-            number ::= [0-9]+)"""
-    auto * grammar = llama_grammar_init_impl(nullptr, grammar_str_temp.c_str(), "root");
-    //
-    
+/*
+PSEUDOCODE:
+1. Initialize and return Llama grammar using string
+3. OutputToken = -1
+4. While OutputToken != End of Grammar (llama_token_is_eog):
+    - convert tokens to llama grammar format
+    - llama_grammar_apply on converted tokens (changes the logits)
+    - update original logits
+    - llama_grammar_accept
+5. grammar_free
 
-    // Save the original grammar stacks so that we can reset after every new string we want to test
-    const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar);
+*/
 
-    llama_grammar_stacks & stacks_cur = llama_grammar_get_stacks(grammar);
-
-    const llama_grammar_rules & rules = llama_grammar_get_rules(grammar);
-    const llama_grammar_stacks & stacks_cur = llama_grammar_get_stacks(grammar);
-
-    const auto cpts = unicode_cpts_from_utf8("1+2+3+4+5");
-
-    for (const auto & cpt : cpts) {
-        const llama_grammar_stacks stacks_prev = llama_grammar_get_stacks(grammar); // copy
-
-        llama_grammar_accept(rules, stacks_prev, cpt, stacks_cur);
-
-        if (stacks_cur.empty()) {
-            // no stacks means that the grammar failed to match at this point
-            std::out << "false";
-        }
-    }
-
-    for (const auto & stack : stacks_cur) {
-        if (stack.empty()) {
-            std::out << "true";
-        }
-    }
-    // √
-    llama_grammar_free_impl(grammar);
-    return;
-
-}
 
 llama_token_data_array logitsToLlamaTokenDataArray(float* logitsCpu, size_t n_vocab) {
     // AW NOTE: from `llama_sampler_sample`
@@ -81,18 +60,41 @@ llama_token_data_array logitsToLlamaTokenDataArray(float* logitsCpu, size_t n_vo
     return cur_p;
 }
 
-/// @brief 
-/// @param dataArray 
-/// @return 
-/// NOTE: this might not be necessary
-std::vector<float> llamaTokenDataArrayToLogits(llama_token_data_array& dataArray) {
-    std::vector<float> output;
-    output.reserve(dataArray.size);
-    for (auto& element : dataArray) {
-        output.insert(element);
-        //TODO: finish this portion
+/// @brief Modifies the `logitsTRTFormat` float array in-place based on the `constrainingGrammar`
+/// @param logitsTRTFormat
+/// @param logitsCount 
+/// @param constrainingGrammar 
+void constrainLogitsToGrammar(float* logitsTRTFormat, size_t logitsCount,  llama_grammar* constrainingGrammar) {
+    llama_token_data_array logitsLlamaFormat = logitsToLlamaTokenDataArray(logitsTRTFormat, logitsCount);
+
+    llama_grammar_apply_impl(constrainingGrammar, &logitsLlamaFormat);
+    for (int i = 0; i < logitsLlamaFormat.size; i++){
+        //get token id
+        llama_token tokenId = logitsLlamaFormat.data[i].id;
+        // update logitsTRTFormat at tokenId slot with logitsLlamaFormat's logit
+        logitsTRTFormat[tokenId] = logitsLlamaFormat.data[i].logit;
     }
+    return;
 }
+    // logitsLlamaFormat.size
+    // for (const auto & cpt : cpts) {
+    //     const llama_grammar_stacks stacks_prev = llama_grammar_get_stacks(grammar); // copy
+
+    //     llama_grammar_accept(rules, stacks_prev, cpt, stacks_cur);
+
+    //     if (stacks_cur.empty()) {
+    //         // no stacks means that the grammar failed to match at this point
+    //         std::out << "false";
+    //     }
+    // }
+
+    // for (const auto & stack : stacks_cur) {
+    //     if (stack.empty()) {
+    //         std::out << "true";
+    //     }
+    // }
+    // // √
+    // llama_grammar_free_impl(grammar);
 
 ///TODO: implement apply and accept on every callback
 
@@ -102,95 +104,36 @@ int main(int argc, char* argv[])
 {
     // Register the TRT-LLM plugins
     initTrtLlmPlugins();
+    
 
     if (argc != 2)
     {
         TLLM_LOG_ERROR("Usage: %s <dir_with_engine_files>", argv[0]);
         return 1;
     }
+    
 
-    std::vector<int> const sentinels = {
-        2201, 128009, 9891, 128001, 32559, 
-        220, 
-        914, 
-        339
-    };
+    static const char* sumGrammar = 
+        R"""(
+            root ::= expr
+            expr ::= term ("+" term)*
+            term ::= number
+            number ::= [0-9]+)""";
+    static llama_grammar * constrainingGrammar = llama_grammar_init_impl(nullptr, sumGrammar, "root");
     int step = 0;
-
-    auto logitsPostProcessorFnOld
-        = [&step, &sentinels](tle::IdType reqId, tle::Tensor& logits, tle::BeamTokens const& tokens,
-              tle::StreamPtr const& streamPtr, std::optional<tle::IdType> clientId)
-    {
-        auto logitsDataType = logits.getDataType();
-        auto logitsCpu = tensorrt_llm::executor::Tensor::cpu(logitsDataType, logits.getShape());
-        logitsCpu.setFrom(logits, streamPtr);
-        auto* dataPtr = logitsCpu.getData();
-        auto* dataPtrFloat = static_cast<float*>(dataPtr);
-        for (size_t i = 0; i < logitsCpu.getSize(); ++i)
-        {
-            bool ban = true;
-            for (int j = 0; j < sentinels.size(); j++) {
-                if (i == sentinels[j]) {
-                    ban = false;
-                    break;
-                }
-            }
-            if (ban) {
-                dataPtrFloat[i] = -1.0e20;
-            } else {
-                // dataPtrFloat[i] = 0.0f;
-            }
-            // dataPtrFloat[i] = ban ? -1.0e20 : 0.0f;
-        }
-        // dataPtrFloat[sentinels[step]] = 0.0f;
-
-        logits.setFrom(logitsCpu, streamPtr);
-        step++;
-        // if (step > 2) {
-        //     break;
-        // }
-        // step = step % 3;
-    };
-#include <string>
-#include <vector>
-#include <cassert>
-
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/plugins/api/tllmPlugin.h"
     auto logitsPostProcessorFn
-        = [&sentinels](tle::IdType reqId, tle::Tensor& logits, tle::BeamTokens const& tokens,
+        = [&constrainingGrammar](tle::IdType reqId, tle::Tensor& logits, tle::BeamTokens const& tokens,
               tle::StreamPtr const& streamPtr, std::optional<tle::IdType> clientId)
     {
         auto logitsDataType = logits.getDataType();
         auto logitsCpu = tensorrt_llm::executor::Tensor::cpu(logitsDataType, logits.getShape());
         logitsCpu.setFrom(logits, streamPtr);
-        auto* dataPtr = logitsCpu.getData();
-        auto* dataPtrFloat = static_cast<float*>(dataPtr);
-        for (size_t i = 0; i < logitsCpu.getSize(); ++i)
-        {
-            bool ban = true;
-            for (int j = 0; j < sentinels.size(); j++) {
-                if (i == sentinels[j]) {
-                    ban = false;
-                    break;
-                }
-            }
-            if (ban) {
-                dataPtrFloat[i] = -1.0e20;
-            } else {
-                // dataPtrFloat[i] = 0.0f;
-            }
-            // dataPtrFloat[i] = ban ? -1.0e20 : 0.0f;
-        }
-        // dataPtrFloat[sentinels[step]] = 0.0f;
-
+        auto* logitsUnformatted = logitsCpu.getData();
+        float* logitsTRTFormat = static_cast<float*>(logitsUnformatted);
+        size_t logitsCount = logitsCpu.getSize();
+        constrainLogitsToGrammar(logitsTRTFormat, logitsCount, constrainingGrammar);
+        
         logits.setFrom(logitsCpu, streamPtr);
-        // if (step > 2) {
-        //     break;
-        // }
-        // step = step % 3;
     };
 
     std::string logitsPostProcessorName = "MyLogitsPP";
@@ -231,19 +174,19 @@ int main(int argc, char* argv[])
     // maxNewTokens = 1; 
     auto request = tle::Request(inputTokens, maxNewTokens);
     request.setLogitsPostProcessorName(logitsPostProcessorName);
-
+    
     // Enqueue the request
     auto requestId = executor.enqueueRequest(std::move(request));
 
     // Wait for the response
     auto responses = executor.awaitResponses(requestId);
+    
+    llama_grammar_free_impl(constrainingGrammar);
 
     // Get outputTokens
-    // for (int n = beamWidth-1; n < responses.size(); n++) {
-        auto outputTokens = responses.at(0).getResult().outputTokenIds.at(beamWidth - 1);
-        // auto outputTokens = responses.at(n).getResult().outputTokenIds.at(beamWidth-1);
+    auto outputTokens = responses.at(0).getResult().outputTokenIds.at(beamWidth - 1);
 
-        TLLM_LOG_INFO("Output tokens: %s", tlc::vec2str(outputTokens).c_str());
+    TLLM_LOG_INFO("Output tokens: %s", tlc::vec2str(outputTokens).c_str());
     // }
 
     return 0;
